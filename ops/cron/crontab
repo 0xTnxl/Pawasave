@@ -30,6 +30,10 @@ CRON_TZ=UTC
 # Offset from the sell reconciler so the two do not queue on the custody lease every run.
 5-59/10 * * * * . /opt/pawasave/cron.env && /opt/pawasave/pawasave-cron.sh /api/cron/equity-buy-reconcile "$HC_EQUITY_BUY_RECONCILE"
 
+# Cross-chain stablecoin deposits: scan USDC/USDT on every enabled chain → cNGN on Base.
+# (No-op unless CROSSCHAIN_DEPOSIT_ENABLED=true; each fill can take minutes, hence the 5-min slot.)
+*/5 * * * *   . /opt/pawasave/cron.env && /opt/pawasave/pawasave-cron.sh /api/cron/scan-crosschain-deposits "$HC_SCAN_CROSSCHAIN_DEPOSITS"
+
 # ── every 15 min ─────────────────────────────────────────────────────────────
 */15 * * * *  . /opt/pawasave/cron.env && /opt/pawasave/pawasave-cron.sh /api/cron/reconcile-withdrawals "$HC_RECONCILE_WITHDRAWALS"
 
@@ -40,6 +44,8 @@ CRON_TZ=UTC
 # ── every 6 hours ────────────────────────────────────────────────────────────
 0 */6 * * *   . /opt/pawasave/cron.env && /opt/pawasave/pawasave-cron.sh /api/cron/update-yield-apy  "$HC_UPDATE_YIELD_APY"
 0 */6 * * *   . /opt/pawasave/cron.env && /opt/pawasave/pawasave-cron.sh /api/cron/loan-maintenance  "$HC_LOAN_MAINTENANCE"
+# Return unclaimed peer-to-peer transfers to the sender once past their expiry.
+0 */6 * * *   . /opt/pawasave/cron.env && /opt/pawasave/pawasave-cron.sh /api/cron/revert-p2p-claims "$HC_REVERT_P2P_CLAIMS"
 
 # ── daily (UTC) ──────────────────────────────────────────────────────────────
 0 0 * * *     . /opt/pawasave/cron.env && /opt/pawasave/pawasave-cron.sh /api/cron/accrue-yield     "$HC_ACCRUE_YIELD"

@@ -13,33 +13,44 @@
  * shape as supplyToLend(). The API's fund-invest path routes through Flutterwave
  * fiat and their fees, which would break the cNGN settlement story.
  *
- * STATUS: DARK. GetEquity is on Base Sepolia (chain 84532); mainnet is pending
- * (~ Aug 2026 per their team). Nothing here runs unless GETEQUITY_ENABLED is set
- * AND GETEQUITY_MARKET_ADDRESS is configured — every export is a no-op / throws
- * clearly otherwise, so this file is inert dead code until we flip it on. Built
- * behind a flag the same way the Strails ramp was (see [[strails-ramp]]).
+ * STATUS: LIVE on Base MAINNET (chain 8453). Nothing here runs unless
+ * GETEQUITY_ENABLED is set AND GETEQUITY_MARKET_ADDRESS is configured — every
+ * export is a no-op / throws clearly otherwise. Built behind a flag the same way
+ * the Strails ramp was (see [[strails-ramp]]).
  *
  * Required env when enabled:
  *   GETEQUITY_ENABLED=1
- *   GETEQUITY_RPC_URL         — RPC for GetEquity's chain (Base Sepolia now, Base mainnet later)
- *   GETEQUITY_MARKET_ADDRESS  — the Market contract (0x68543Dc7…C4bc on Sepolia)
+ *   GETEQUITY_RPC_URL         — Base MAINNET RPC (use a reliable paid one; the public
+ *                               mainnet.base.org gives spurious "missing revert data")
+ *   GETEQUITY_MARKET_ADDRESS  — the Market contract (0x716B…A2DD on Base mainnet)
  *   CUSTODY_PRIVATE_KEY       — reused; the custody wallet buys/holds the positions
  *
- * Contracts (Base Sepolia testnet — swap for mainnet on their launch):
- *   Market   0x68543Dc71F76d0835e724dbEF898Dd010209C4bc
- *   cNGN     0x7E29CF1D8b1F4c847D0f821b79dDF6E67A5c11F8
- *   NTBL     0xda42AEaC0A2ab7938C20Eb75221e9678f0d431aD  (Nigerian Treasury Bill)
- *   ANMF     0xBdd5357A6c17B3d55Ab0A15C608d26A357c2C8C5  (ARM NGN Mutual Fund)
+ * Contracts (Base MAINNET 8453 — verified on-chain 2026-09-15, all settle in cNGN):
+ *   Market   0x716B0B731f2FB292C74BD121485d930FA3dEA2DD
+ *   cNGN     0x46C85152bFe9f96829aA94755D9f915F9B10EF5F  (6-dp payout token)
+ *   DPRI     0xc68b460fe4c916Fd17d6ab6b181A409C763002d9  (Dangote Refinery IPO, 18-dp, ~1% fee)
+ *   NTBS5    0x7d7177214b2340e8046c9E802Ef7de19c7c0F2F1  (Nigerian T-Bill Series 5, 18-dp, ~0.5% fee)
+ * (The mutual fund / ANMF is not yet listed on mainnet — testnet only.)
  */
 
 import { ethers } from 'ethers'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { getSecret } from './secrets'
+import {
+  custodyCngnBalance, custodyCngnBalanceFresh, cngnToShares, custodyLendShares, withdrawFromLend,
+} from './custody'
 
 export const GETEQUITY_ENABLED =
   !!process.env.GETEQUITY_ENABLED && !!process.env.GETEQUITY_MARKET_ADDRESS
 
 const MARKET_ADDRESS = (process.env.GETEQUITY_MARKET_ADDRESS || '') as string
+
+// GetEquity's Market enforces a minimum lot size per buy. Default 10 units (their
+// current floor). Override with GETEQUITY_MIN_UNITS if it changes per asset/listing.
+export const GETEQUITY_MIN_UNITS: bigint = (() => {
+  const n = Number(process.env.GETEQUITY_MIN_UNITS)
+  return Number.isFinite(n) && n >= 1 ? BigInt(Math.floor(n)) : 10n
+})()
 
 // GetEquity's chain is distinct from PawaSave custody's mainnet write RPC while
 // they're on testnet, so this client carries its OWN provider. Once GetEquity is
@@ -241,6 +252,37 @@ export async function buyAsset(
  * is denominated in the asset's payout token. This assumes a single admin-set price
  * per asset (their docs), i.e. cost is linear in quantity.
  */
+/**
+ * Ensure the custody wallet holds `needMicro` of FREE cNGN before a buy. The reconcile
+ * sweeps idle custody cNGN into PawasaveLend for yield, so custody's free balance is
+ * usually ~0 — the working cNGN lives as psNGN shares in the pool. Redeem just enough
+ * (plus a 1% rounding buffer, capped at the shares custody holds) back to the wallet.
+ * Mirrors equity-broker's ensureFreeCngn so GetEquity buys draw from the SAME float
+ * instead of needing custody pre-funded. Throws on a real liquidity shortfall.
+ */
+async function ensureFreeCngn(needMicro: bigint): Promise<void> {
+  const free = await custodyCngnBalance()
+  if (free >= needMicro) return
+  const shortfall = needMicro - free
+  let shares = await cngnToShares(shortfall + shortfall / 100n)
+  const held = await custodyLendShares()
+  if (shares > held) shares = held
+  if (shares <= 0n) {
+    throw new Error(`Insufficient cNGN liquidity: pool holds no redeemable shares, need ₦${(Number(needMicro) / 1e6).toFixed(0)}`)
+  }
+  const { cngnMicro } = await withdrawFromLend(shares)
+  if (cngnMicro > 0n) {
+    if (free + cngnMicro < needMicro) {
+      throw new Error(`Insufficient cNGN liquidity: redeemed ₦${(Number(free + cngnMicro) / 1e6).toFixed(0)}, need ₦${(Number(needMicro) / 1e6).toFixed(0)}`)
+    }
+    return
+  }
+  const after = await custodyCngnBalanceFresh()
+  if (after < needMicro) {
+    throw new Error(`Insufficient cNGN liquidity: custody has ~₦${(Number(after) / 1e6).toFixed(0)} after pool withdraw, need ₦${(Number(needMicro) / 1e6).toFixed(0)}`)
+  }
+}
+
 export async function buyWithCngn(
   token: string,
   cngnMicroBudget: bigint,
@@ -258,6 +300,15 @@ export async function buyWithCngn(
   // Units (18-dp base) the budget affords, floored so cost never exceeds budget.
   const unitsBase = (cngnMicroBudget * ONE) / per.totalCost
   if (unitsBase <= 0n) throw new Error('Amount too small for this asset')
+  // GetEquity enforces a minimum lot size (default 10 units) — a smaller buy reverts
+  // on-chain. Guard here so we never send a doomed tx (configurable via env).
+  if (unitsBase < GETEQUITY_MIN_UNITS * ONE) {
+    throw new Error(`Minimum purchase is ${GETEQUITY_MIN_UNITS} units`)
+  }
+
+  // Custody's working cNGN lives in the PawasaveLend pool (the reconcile sweeps it there
+  // for yield), so redeem enough back to the wallet to cover this buy before spending.
+  await ensureFreeCngn(cngnMicroBudget)
 
   // Approve the payout token to the Market once (MAX), then buy with the budget cap.
   const rwaRead = new ethers.Contract(token, RWA_ABI, signer)
